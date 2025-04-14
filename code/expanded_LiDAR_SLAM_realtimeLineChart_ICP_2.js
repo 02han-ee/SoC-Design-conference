@@ -1,16 +1,17 @@
 /*************************************************************
  * expanded_LiDAR_SLAM_realtimeLineChart_CSV_AllData_WITH_REAL_ICP.js
- *
+ * 알고리즘 종류가 바뀌면 바로 CSV 파일 다운로드
  * (기존 코드에서 업그레이드/추가된 사항)
  * 1) ICP/GraphSLAM 모드에 "간단한 실제 ICP" 로직을 추가:
- *    - 직전 프레임의 LiDAR 스캔 vs 현재 프레임 스캔
+ *    - 직전 프레임의 LiDAR 스캔 vs 현재 스캔
  *    - 최근접 점 매칭 + SVD를 통해 2D rigid transform 도출
  *    - 로봇의 estimatedPos(x,y, heading)를 실제 회전·이동으로 보정
  * 2) 다른 기능(드로잉, DR/KF/PF, CSV, 차트 등)은 전부 유지
  * 
  * KF 필터 수정(25.4.14.오후 6PM14M 기준)
- * PF 필터 수정(25.4.14.오후 6PM44M 기준)
- **** PF 필터 문제 있음, 잘 안 돌아감, 완벽한 코드 아님.
+ * PF 필터 재수정(25.4.14.오후 8PM10M 기준)
+ * ICP 필터 수정(25.4.14.오후 8PM10M 기준)
+ 
  *************************************************************/
 
 let walls = [];
@@ -22,7 +23,8 @@ let resolutionSlider;
 let lidarModeButton;
 
 let algoSelect; // <select> DOM
-let currentAlgo = "DR"; // 기본값 DR
+// 기본 알고리즘은 빈 문자열로 지정(시작 전 반드시 선택하도록 함)
+let currentAlgo = "";
 
 // FPS 측정
 let lastTime = 0;
@@ -78,18 +80,37 @@ function setup() {
   resolutionSlider = createSlider(1, 15, 1, 1);
   resolutionSlider.position(360, 10);
 
+  // --- 알고리즘 선택 및 변경 관련 부분 수정 ---
   algoSelect = createSelect();
   algoSelect.position(520, 10);
+  // 플레이스홀더 옵션 추가
+  algoSelect.option('Select Algorithm');
   algoSelect.option('DR');
   algoSelect.option('KF');
   algoSelect.option('PF');
   // [ADDED] ICP 모드
   algoSelect.option('ICP/GraphSLAM');
   algoSelect.changed(() => {
-    currentAlgo = algoSelect.value();
-    sumSquaredError = 0;
-    numErrorSamples = 0;
+    let newAlgo = algoSelect.value();
+    // 플레이스홀더 선택시 아무것도 하지 않음
+    if (newAlgo === 'Select Algorithm') {
+      return;
+    }
+    
+    // 만약 이미 알고리즘이 설정되어 있고(시뮬레이션 진행 중) 변경되면
+    // 지금까지의 데이터를 CSV 파일로 저장하고 시뮬레이션을 리셋합니다.
+    if (currentAlgo !== "" && currentAlgo !== newAlgo && dataLog.length > 0) {
+      exportCSV();           // 현재까지의 데이터를 CSV로 저장
+      dataLog = [];          // 데이터 로그 재초기화
+      persistentPoints = []; // persistentPoints 초기화
+      sumSquaredError = 0;   // 에러 누적 변수 초기화
+      numErrorSamples = 0;   // 에러 샘플 카운트 초기화
+      robot = new Robot(width / 4, height / 2); // 로봇 상태 재초기화
+    }
+    
+    currentAlgo = newAlgo;
   });
+  // --- 여기까지 알고리즘 관련 수정 ---
 
   exportButton = createButton('Export CSV');
   exportButton.position(700, 10);
@@ -589,7 +610,9 @@ class Robot {
         // 파티클 배열 초기화 (최초 한 번)
         if (!this.particles) {
           this.particles = [];
-          for (let i = 0; i < this.particleCount; i++) {
+          // 파티클 수가 너무 많다면 하드웨어에 맞게 줄일 수 있음
+          let effectiveParticleCount = this.particleCount; // 예: 1000
+          for (let i = 0; i < effectiveParticleCount; i++) {
             this.particles.push({
               x: this.estimatedPos.x,
               y: this.estimatedPos.y,
@@ -624,11 +647,11 @@ class Robot {
           p.y += v * dt * sin(p.theta) + randomGaussian(0, motionNoiseTrans);
         }
         
-        // PF 측정 업데이트: 계산량 줄이기 위해 각 파티클 당 5개 샘플만 사용
+        // PF 측정 업데이트: 계산량 줄이기 위해 각 파티클 당 샘플 수를 3개로 축소
         function simulateScan(particle) {
           let scanPoints = [];
           const maxDist = 150;
-          const numSamples = 5;  // 샘플 수 축소
+          const numSamples = 3;  // 기존 5 -> 3 샘플
           for (let i = 0; i < numSamples; i++) {
             // -PI/4부터 PI/4까지 균등하게 샘플링
             let a = -PI/4 + i * ((PI/2) / (numSamples - 1));
@@ -666,48 +689,52 @@ class Robot {
         }
         
         // 실제 LiDAR 스캔(currentScan)으로부터 centroid 계산
-        let actualCentroid = null;
-        if (currentScan && currentScan.length > 0) {
-          let sumX = 0, sumY = 0;
-          for (let pt of currentScan) {
-            sumX += pt.x;
-            sumY += pt.y;
-          }
-          actualCentroid = { x: sumX / currentScan.length, y: sumY / currentScan.length };
+        if (!(currentScan && currentScan.length > 0)) {
+          break; // 스캔 데이터가 없으면 업데이트 건너뜀
         }
+        let sumX = 0, sumY = 0;
+        for (let pt of currentScan) {
+          sumX += pt.x;
+          sumY += pt.y;
+        }
+        let actualCentroid = { x: sumX / currentScan.length, y: sumY / currentScan.length };
         
         // 각 파티클마다 예상 스캔의 centroid와 실제 centroid 사이 오차를 이용해 가중치 계산
         const sensorSigma = 20; // 센서 노이즈 표준편차
         let weightSum = 0;
         for (let p of this.particles) {
           let predictedScan = simulateScan(p);
-          let sumX = 0, sumY = 0;
+          let sX = 0, sY = 0;
           for (let pt of predictedScan) {
-            sumX += pt.x;
-            sumY += pt.y;
+            sX += pt.x;
+            sY += pt.y;
           }
-          let predCentroid = { x: sumX / predictedScan.length, y: sumY / predictedScan.length };
+          let predCentroid = { x: sX / predictedScan.length, y: sY / predictedScan.length };
           let error = dist(predCentroid.x, predCentroid.y, actualCentroid.x, actualCentroid.y);
           p.weight = Math.exp(- (error * error) / (2 * sensorSigma * sensorSigma));
           weightSum += p.weight;
         }
         
-        // 가중치 정규화
-        for (let p of this.particles) {
-          p.weight /= weightSum;
+        // 가중치 정규화 (0이면 uniform weight 할당)
+        if (weightSum === 0) {
+          for (let p of this.particles) {
+            p.weight = 1.0 / this.particles.length;
+          }
+        } else {
+          for (let p of this.particles) {
+            p.weight /= weightSum;
+          }
         }
         
-        // 순차적 리샘플링 (Systematic Resampling) 방식 사용
+        // 순차적 리샘플링 (Systematic Resampling)
         let newParticles = [];
         let N = this.particles.length;
-        // 누적 가중치 배열 계산
         let cumsum = [];
         let cum = 0;
         for (let p of this.particles) {
           cum += p.weight;
           cumsum.push(cum);
         }
-        // 시작 위치: [0, 1/N)
         let start = random(0, 1/N);
         let positions = [];
         for (let i = 0; i < N; i++) {
@@ -718,12 +745,11 @@ class Robot {
           while (pos > cumsum[index]) {
             index++;
           }
-          // 복제 후 가중치는 초기화
           newParticles.push({ x: this.particles[index].x, y: this.particles[index].y, theta: this.particles[index].theta, weight: 1.0 });
         }
         this.particles = newParticles;
         
-        // 파티클 분포의 평균을 추정 위치로 업데이트 (조금씩 보정)
+        // 파티클 분포의 평균을 추정 위치로 업데이트 (보정)
         let meanX = 0, meanY = 0;
         for (let p of this.particles) {
           meanX += p.x;
@@ -736,6 +762,7 @@ class Robot {
         
         break;
       }
+
 
 
 
@@ -889,3 +916,4 @@ function distToSegment(p, v, w){
   let proj = createVector(v.x + t*(w.x - v.x), v.y + t*(w.y - v.y));
   return p5.Vector.dist(p, proj);
 }
+
