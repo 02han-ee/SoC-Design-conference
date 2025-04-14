@@ -1,0 +1,157 @@
+/*************************************************************
+ * expanded_LiDAR_SLAM_realtimeLineChart_CSV_AllData_WITH_REAL_ICP_2.js 에 적용
+ *
+ * [ version 1 ]
+ * 돌아가긴 하는데, 너무 과부하가 오래 걸림, 따라서 최종 코드에는 사용하지 않을 예정
+ * 실제 파티클 배열(this.particles)을 초기화한 후, 매 프레임마다 제어 입력에 따른 모션 업데이트(노이즈 포함), 
+ * 각 파티클마다 예상 LiDAR 스캔을 시뮬레이션하여 스캔의 centroid를 구하고, 이를 실제 스캔 centroid와 비교해 가중치를 계산한 후, 
+ * 리샘플링(roulette wheel 방식)을 수행합니다. 마지막으로 파티클들의 평균을 구해 로봇의 추정 위치(estimatedPos)를 보정
+ * 
+ * [ version 2 ]
+ *************************************************************/
+
+// [ version 1 ]
+
+      case 'PF': {
+        // 파티클 배열 초기화 (최초 한 번)
+        if (!this.particles) {
+          this.particles = [];
+          for (let i = 0; i < this.particleCount; i++) {
+            this.particles.push({
+              x: this.estimatedPos.x,
+              y: this.estimatedPos.y,
+              theta: this.heading,
+              weight: 1.0
+            });
+          }
+        }
+        
+        // 제어 입력 추출 (로봇과 동일하게)
+        let v = 0;
+        if (keyIsDown(UP_ARROW)) {
+          v = 2;
+        } else if (keyIsDown(DOWN_ARROW)) {
+          v = -2;
+        }
+        let omega = 0;
+        if (keyIsDown(LEFT_ARROW)) {
+          omega = -0.03;
+        } else if (keyIsDown(RIGHT_ARROW)) {
+          omega = 0.03;
+        }
+        let dt = deltaTimeMS / 1000;
+        if (!isFinite(dt) || dt <= 0) dt = 0.016;
+        
+        // 모션 업데이트: 각 파티클에 대해 제어 입력에 따른 이동 + 노이즈 추가
+        const motionNoiseTrans = 0.5; // 위치 노이즈 표준편차
+        const motionNoiseRot = 0.01;  // 회전 노이즈 표준편차
+        for (let p of this.particles) {
+          p.theta += omega * dt + randomGaussian(0, motionNoiseRot);
+          p.x += v * dt * cos(p.theta) + randomGaussian(0, motionNoiseTrans);
+          p.y += v * dt * sin(p.theta) + randomGaussian(0, motionNoiseTrans);
+        }
+        
+        // 파티클 별로 예상 LiDAR 스캔 시뮬레이션 함수
+        function simulateScan(particle) {
+          let scanPoints = [];
+          const maxDist = 150;
+          const res = resolutionSlider.value(); // 슬라이더 값(1~15)이 각도 단위(°)로 사용됨
+          for (let a = -PI / 4; a <= PI / 4; a += radians(res)) {
+            let rayAngle = particle.theta + a;
+            let rayOrigin = createVector(particle.x, particle.y);
+            let rayDir = p5.Vector.fromAngle(rayAngle);
+            
+            let closest = null;
+            let record = maxDist;
+            for (let wall of walls) {
+              const x1 = wall.a.x, y1 = wall.a.y;
+              const x2 = wall.b.x, y2 = wall.b.y;
+              const x3 = rayOrigin.x, y3 = rayOrigin.y;
+              const x4 = rayOrigin.x + rayDir.x * maxDist, y4 = rayOrigin.y + rayDir.y * maxDist;
+              
+              const den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+              if (den === 0) continue;
+              const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / den;
+              const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / den;
+              if (t > 0 && t < 1 && u > 0 && u < 1) {
+                const pt = createVector(x1 + t * (x2 - x1), y1 + t * (y2 - y1));
+                let d = p5.Vector.dist(rayOrigin, pt);
+                if (d < record) {
+                  record = d;
+                  closest = pt;
+                }
+              }
+            }
+            if (closest) {
+              scanPoints.push(closest);
+            } else {
+              // 벽에 닿지 않으면 최대 거리에 해당하는 점 사용
+              scanPoints.push(createVector(rayOrigin.x + rayDir.x * maxDist, rayOrigin.y + rayDir.y * maxDist));
+            }
+          }
+          return scanPoints;
+        }
+        
+        // 실제 LiDAR 스캔(currentScan)으로부터 centroid 계산
+        let actualCentroid = null;
+        if (currentScan && currentScan.length > 0) {
+          let sumX = 0, sumY = 0;
+          for (let pt of currentScan) {
+            sumX += pt.x;
+            sumY += pt.y;
+          }
+          actualCentroid = { x: sumX / currentScan.length, y: sumY / currentScan.length };
+        }
+        
+        // 각 파티클에 대해 예상 스캔을 시뮬레이션하고, predicted centroid와 실제 centroid 간 오차로 가중치 계산
+        const sensorSigma = 20; // 센서 노이즈 표준편차
+        let weightSum = 0;
+        for (let p of this.particles) {
+          let predictedScan = simulateScan(p);
+          let sumX = 0, sumY = 0;
+          for (let pt of predictedScan) {
+            sumX += pt.x;
+            sumY += pt.y;
+          }
+          let predCentroid = { x: sumX / predictedScan.length, y: sumY / predictedScan.length };
+          // 오차: 두 centroid 사이 유클리드 거리
+          let error = dist(predCentroid.x, predCentroid.y, actualCentroid.x, actualCentroid.y);
+          p.weight = Math.exp(- (error * error) / (2 * sensorSigma * sensorSigma));
+          weightSum += p.weight;
+        }
+        
+        // 가중치 정규화
+        for (let p of this.particles) {
+          p.weight /= weightSum;
+        }
+        
+        // 리샘플링: 롤렛휠 방식으로 새로운 파티클 배열 생성
+        let newParticles = [];
+        let N = this.particles.length;
+        for (let i = 0; i < N; i++) {
+          let r = random();
+          let accum = 0;
+          for (let p of this.particles) {
+            accum += p.weight;
+            if (accum >= r) {
+              // 파티클 복제 (가중치는 초기화)
+              newParticles.push({ x: p.x, y: p.y, theta: p.theta, weight: 1.0 });
+              break;
+            }
+          }
+        }
+        this.particles = newParticles;
+        
+        // 파티클 분포의 평균을 추정 위치로 업데이트 (조금씩 보정)
+        let meanX = 0, meanY = 0;
+        for (let p of this.particles) {
+          meanX += p.x;
+          meanY += p.y;
+        }
+        meanX /= this.particles.length;
+        meanY /= this.particles.length;
+        this.estimatedPos.x = lerp(this.estimatedPos.x, meanX, 0.1);
+        this.estimatedPos.y = lerp(this.estimatedPos.y, meanY, 0.1);
+        
+        break;
+      }
