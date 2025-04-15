@@ -38,7 +38,7 @@ let exportButton;
  * [자동 이동/자동 실험 실행 관련]
  ***************************************************/
 let autoMove = true;           
-let testDuration = 3000;  // 1분 30초
+let testDuration = 30000;  // 1분 30초
 let startTime = 0;             
 let movePhase = 0;             
 let phaseTime = 0;             
@@ -101,7 +101,7 @@ function setup() {
   walls.push(new Boundary(0, height, 0, 0));
 
   // (2) 내부에 3개 랜덤 벽
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 8; i++) {
     let x1 = random(200, 1000);
     let y1 = random(100, 500);
     let x2 = random(200, 1000);
@@ -333,9 +333,57 @@ function draw() {
   text(`Resolution: ${resolutionSlider.value()}`, 10, 90);
   text(`Basic RMSE: ${basicRMSE.toFixed(2)}`, 10, 110);
   text(`Power: ${estimatedPower.toFixed(2)}`, 10, 130);
+
+//////////////////////////////////////////////////////////////////////////
+
+  // (C) 오른쪽 영역에 RMSE 그래프
+  //   "rmse" 라벨을 real-time line chart
+  //   예: x=620, y=20, w=560, h=250
+  drawRMSEChart(620, 20, 560, 250, dataLog, "rmse");
+
+
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// ------------------ RMSE chart 함수 ------------------
+function drawRMSEChart(x, y, w, h, dataArray, property) {
+    push();
+    translate(x, y);
+  
+    // 배경
+    fill(60);
+    noStroke();
+    rect(0, 0, w, h);
+  
+    // 축 range 대충 0..200 등(또는 data scanning)
+    // 여기선 0..200 임의, 필요시 더 크게
+    let minVal = 0;
+    let maxVal = 200;
+  
+    stroke(200);
+    strokeWeight(2);
+    noFill();
+    beginShape();
+    for(let i=0; i<dataArray.length; i++){
+      let px = map(i, 0, dataArray.length-1, 0, w);
+      let py = map(dataArray[i][property], minVal, maxVal, h, 0);
+      vertex(px, py);
+    }
+    endShape();
+  
+    fill(255);
+    noStroke();
+    textSize(12);
+    text("RMSE (pos vs est)", 5, 15);
+    pop();
+}
+
+
+
+/////////////////////////////////////////////////////////////////////////////////
+
 
 // ------------------ 5) updateRMSETrackers() 함수 ------------------
 function updateRMSETrackers(algo) {
