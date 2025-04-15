@@ -1,0 +1,970 @@
+let walls = [];
+let robot;
+let persistentPoints = [];
+let showWalls = false;
+let showPersistent = false;
+let resolutionSlider;
+let lidarModeButton;
+
+let algoSelect; // <select> DOM
+let currentAlgo = "";
+
+// FPS 측정
+let lastTime = 0;
+let avgFPS = 0;
+let frameCount = 0;
+
+// 오차(RMSE) 측정
+let sumSquaredError = 0;
+let numErrorSamples = 0;
+
+// 전력 추정
+let basePower = 5;
+let rayCost = 0.05;
+let pfCost = 0.3;
+let icpCost = 0.6; 
+let estimatedPower = 0;
+
+// 메모리 제한
+let maxPersistentPoints = 3000;
+
+// 데이터 로그
+let dataLog = [];
+
+// CSV Export 버튼
+let exportButton;
+
+/***************************************************
+ * [자동 이동/자동 실험 실행 관련]
+ ***************************************************/
+let autoMove = true;           
+let testDuration = 900;  // 1분 30초
+let startTime = 0;             
+let movePhase = 0;             
+let phaseTime = 0;             
+
+// [자동 실험] 해상도/알고리즘 순차 실행
+let autoExperiment = true;     
+let resolutions = [1, 5, 10, 15];
+let algorithms = ['DR', 'KF', 'PF', 'ICP/GraphSLAM'];
+let experimentList = [];
+let currentExperimentIndex = 0;
+
+// -------------------------------------------------------------
+function buildExperimentList() {
+  for (let r of resolutions) {
+    for (let a of algorithms) {
+      experimentList.push({res: r, algo: a});
+    }
+  }
+}
+
+// -------------------------------------------------------------
+function setup() {
+  createCanvas(1200, 600);
+
+  // 항상 동일한 벽 랜덤시드를 위해
+  randomSeed(0);
+
+  // (1) 사각형 테두리 (전체 캔버스 경계)
+  walls.push(new Boundary(0, 0, width, 0));
+  walls.push(new Boundary(width, 0, width, height));
+  walls.push(new Boundary(width, height, 0, height));
+  walls.push(new Boundary(0, height, 0, 0));
+
+  // (2) 내부에 3개 랜덤 벽
+  for (let i = 0; i < 3; i++) {
+    let x1 = random(200, 1000);
+    let y1 = random(100, 500);
+    let x2 = random(200, 1000);
+    let y2 = random(100, 500);
+    walls.push(new Boundary(x1, y1, x2, y2));
+  }
+
+  robot = new Robot(width / 4, height / 2);
+
+  let toggleButton = createButton('Toggle Walls');
+  toggleButton.position(10, 10);
+  toggleButton.mousePressed(() => (showWalls = !showWalls));
+
+  lidarModeButton = createButton('Toggle Persistent LiDAR (SLAM)');
+  lidarModeButton.position(120, 10);
+  lidarModeButton.mousePressed(() => (showPersistent = !showPersistent));
+
+  resolutionSlider = createSlider(1, 15, 1, 1);
+  resolutionSlider.position(360, 10);
+
+  // 알고리즘 선택 Select
+  algoSelect = createSelect();
+  algoSelect.position(520, 10);
+  algoSelect.option('Select Algorithm');
+  algoSelect.option('DR');
+  algoSelect.option('KF');
+  algoSelect.option('PF');
+  algoSelect.option('ICP/GraphSLAM');
+  algoSelect.changed(() => {
+    let newAlgo = algoSelect.value();
+    if (newAlgo === 'Select Algorithm') return;
+
+    if (currentAlgo !== "" && currentAlgo !== newAlgo && dataLog.length > 0) {
+      exportCSV();
+      resetSimulation();
+    }
+    currentAlgo = newAlgo;
+  });
+
+  exportButton = createButton('Export CSV');
+  exportButton.position(700, 10);
+  exportButton.mousePressed(exportCSV);
+
+  startTime = millis();
+  buildExperimentList();
+  if (autoExperiment && experimentList.length > 0) {
+    applyExperimentParameters(0);
+  }
+}
+
+// ------------------------------------------------------------
+function draw() {
+  background(30);
+
+  // FPS
+  let now = performance.now();
+  let delta = now - lastTime;
+  lastTime = now;
+  frameCount++;
+  let instFPS = 1000 / (delta || 1);
+  if (frameCount === 1) {
+    avgFPS = instFPS;
+  } else {
+    avgFPS = 0.9 * avgFPS + 0.1 * instFPS;
+  }
+
+  // 실험 시간 경과 체크
+  if (millis() - startTime > testDuration) {
+    exportCSV();
+    nextExperiment(); 
+    return;
+  }
+
+  // 벽 표시
+  if (showWalls) {
+    push();
+    for (let wall of walls) {
+      wall.show();
+    }
+    pop();
+  }
+
+  robot.update(delta);
+  let currentPoints = robot.look(walls);
+  robot.show();
+
+  // LiDAR 점
+  fill(255, 0, 0);
+  noStroke();
+  for (let p of currentPoints) {
+    ellipse(p.x, p.y, 5);
+    if (showPersistent) {
+      persistentPoints.push(p.copy());
+    }
+  }
+
+  if (persistentPoints.length > maxPersistentPoints) {
+    persistentPoints.splice(0, persistentPoints.length - maxPersistentPoints);
+  }
+  if (showPersistent) {
+    fill(255, 100, 100, 80);
+    noStroke();
+    for (let p of persistentPoints) {
+      ellipse(p.x, p.y, 3);
+    }
+  }
+
+  // 알고리즘 추정 업데이트
+  robot.updateEstimation(currentAlgo, delta, currentPoints);
+
+  // RMSE (pos vs estimatedPos)
+  let dx = robot.pos.x - robot.estimatedPos.x;
+  let dy = robot.pos.y - robot.estimatedPos.y;
+  let distSq = dx*dx + dy*dy;
+  sumSquaredError += distSq;
+  numErrorSamples++;
+  let rmse = sqrt(sumSquaredError/(numErrorSamples||1));
+
+  // 전력 추정
+  let numRays = robot.rays.length;
+  estimatedPower = basePower + numRays*rayCost;
+  if(currentAlgo==='PF'){
+    estimatedPower += pfCost*numRays;
+  } else if(currentAlgo==='ICP/GraphSLAM'){
+    estimatedPower += icpCost*numRays;
+  }
+
+  // ---- 추가 데이터: heading error, KF traceP, PF 분산, ICP inliers ----
+  let headingErr = 0; 
+  // 실제 heading vs 추정 heading(있다면) 비교
+  let algoHeadingEst = 0; 
+  if(currentAlgo==='KF' && robot.kf){
+    algoHeadingEst = robot.kf.theta;
+    headingErr = angleDiff(robot.heading, algoHeadingEst);
+  } 
+  else if(currentAlgo==='PF' && robot.particles){
+    // 파티클들의 원형 평균을 이용하여 PF의 추정 heading을 계산
+    let sumCos = 0, sumSin = 0;
+    for (let p of robot.particles) {
+      sumCos += Math.cos(p.theta);
+      sumSin += Math.sin(p.theta);
+    }
+    let avgTheta = Math.atan2(sumSin, sumCos);
+    // 실제 heading (robot.heading)와 파티클 평균 heading 간 차이 계산 (angleDiff 함수 이용)
+    headingErr = angleDiff(robot.heading, avgTheta);
+  }
+
+  else if(currentAlgo==='ICP/GraphSLAM'){
+    headingErr = angleDiff(robot.heading, 0); // 단순 비교가 애매해 0.
+  }
+  else {
+    // DR
+    headingErr = angleDiff(robot.heading, 0);
+  }
+
+  // KF trace(P)
+  let kfTraceP = 0;
+  if(currentAlgo==='KF' && robot.kf){
+    let P= robot.kf.P;
+    kfTraceP = (P[0][0]+ P[1][1] + P[2][2]);
+  }
+
+  // PF 분산
+  let pfVariance = 0;
+  if(currentAlgo==='PF' && robot.particles){
+    // x,y 분산
+    let sx=0,sy=0, n=robot.particles.length;
+    for(let p of robot.particles){
+      sx+= p.x; sy+= p.y;
+    }
+    let mx= sx/n, my= sy/n;
+    let sumv=0; // x^2 + y^2 평균
+    for(let p of robot.particles){
+      let dx= p.x-mx, dy= p.y-my;
+      sumv+= (dx*dx+ dy*dy);
+    }
+    pfVariance= sumv/(n||1);
+  }
+
+  // ICP 커플링 inliers (마지막 반복에서 사용한 pairs 수)
+  // robot.tmpICPInlierCount에 저장해두었다고 가정
+  let icpPairCount= (robot.tmpICPInlierCount||0);
+
+  // ---- 로그 확장 ----
+  dataLog.push({
+    frame: frameCount,
+    fps: avgFPS,
+    rmse: rmse,
+    power: estimatedPower,
+    resolution: resolutionSlider.value(),
+    algo: currentAlgo,
+
+    trueX: robot.pos.x,
+    trueY: robot.pos.y,
+    trueHeading: robot.heading,
+    estX: robot.estimatedPos.x,
+    estY: robot.estimatedPos.y,
+    headingError: headingErr,
+
+    kfTraceP: kfTraceP,
+    pfVariance: pfVariance,
+    icpPairCount: icpPairCount
+  });
+
+  // ---- 좌측 상단 ----
+  fill(255);
+  textSize(14);
+  text(`FPS (avg): ${avgFPS.toFixed(2)}`, 10, 50);
+  text(`Algo Mode: ${currentAlgo}`, 10, 70);
+  text(`Resolution: ${resolutionSlider.value()}`, 10, 90);
+  text(`RMSE: ${rmse.toFixed(2)}`, 10, 110);
+  text(`Power: ${estimatedPower.toFixed(2)}`, 10, 130);
+}
+
+function angleDiff(a, b){
+  // wrap angles
+  let d= (a-b) % (2*PI);
+  if(d>PI) d-= 2*PI;
+  if(d< -PI) d+= 2*PI;
+  return d;
+}
+
+// ------------------------------------------------------------
+function nextExperiment() {
+  currentExperimentIndex++;
+  if(currentExperimentIndex>= experimentList.length){
+    console.log("All experiments completed.");
+    noLoop();
+    return;
+  }
+  resetSimulation();
+  applyExperimentParameters(currentExperimentIndex);
+}
+
+function applyExperimentParameters(index) {
+  let exp= experimentList[index];
+  resolutionSlider.value(exp.res);
+  algoSelect.value(exp.algo);
+  currentAlgo= exp.algo;
+  console.log(`Starting experiment #${index} => Resolution=${exp.res}, Algo=${exp.algo}`);
+}
+
+function resetSimulation() {
+  dataLog= [];
+  persistentPoints= [];
+  sumSquaredError=0;
+  numErrorSamples=0;
+  frameCount=0;
+  avgFPS=0;
+  lastTime= performance.now();
+
+  robot= new Robot(width/4, height/2);
+
+  startTime= millis();
+  movePhase=0;
+  phaseTime=0;
+}
+
+function drawTripleLineCharts(x, y, w, h, dataArray) {
+  push();
+  let areaH= h/3;
+
+  // FPS (top)
+  push();
+  translate(x, y);
+  drawLineChartForProperty(0,0, w,areaH, dataArray, "fps", 0,60, color(0,255,0), "FPS");
+  pop();
+
+  // RMSE (middle)
+  push();
+  translate(x, y+ areaH);
+  drawLineChartForProperty(0,0, w,areaH, dataArray, "rmse", 0,100, color(0,100,255), "RMSE");
+  pop();
+
+  // Power (bottom)
+  push();
+  translate(x, y+ 2*areaH);
+  drawLineChartForProperty(0,0, w,areaH, dataArray, "power", 0,50, color(255,80,80), "Power");
+  pop();
+
+  pop();
+}
+
+function drawLineChartForProperty(x,y,w,h, dataArray, property, minVal,maxVal, col,label){
+  push();
+  fill(60);
+  noStroke();
+  rect(x,y, w,h);
+
+  stroke(col);
+  strokeWeight(2);
+  noFill();
+  beginShape();
+  for(let i=0;i<dataArray.length;i++){
+    let px= map(i, 0,dataArray.length-1, x, x+w);
+    let py= map(dataArray[i][property], minVal,maxVal, y+h, y);
+    vertex(px, py);
+  }
+  endShape();
+
+  noStroke();
+  fill(255);
+  textSize(12);
+  text(label, x+5, y+15);
+  text(minVal, x+5, y+h-5);
+  text(maxVal, x+5, y+15);
+  pop();
+}
+
+// ------------------------------------------------------------
+function exportCSV() {
+  let table= new p5.Table();
+
+  // 기존 6개 + 추가 열
+  table.addColumn("frame");
+  table.addColumn("fps");
+  table.addColumn("rmse");
+  table.addColumn("power");
+  table.addColumn("resolution");
+  table.addColumn("algo");
+
+  table.addColumn("trueX");
+  table.addColumn("trueY");
+  table.addColumn("trueHeading");
+  table.addColumn("estX");
+  table.addColumn("estY");
+  table.addColumn("headingError");
+  table.addColumn("kfTraceP");
+  table.addColumn("pfVariance");
+  table.addColumn("icpPairCount");
+
+  for(let i=0; i<dataLog.length; i++){
+    let row= table.addRow();
+    row.setString("frame", dataLog[i].frame);
+    row.setString("fps", nf(dataLog[i].fps,2,2));
+    row.setString("rmse", nf(dataLog[i].rmse,2,2));
+    row.setString("power", nf(dataLog[i].power,2,2));
+    row.setString("resolution", dataLog[i].resolution);
+    row.setString("algo", dataLog[i].algo);
+
+    row.setString("trueX", nf(dataLog[i].trueX,2,2));
+    row.setString("trueY", nf(dataLog[i].trueY,2,2));
+    row.setString("trueHeading", nf(dataLog[i].trueHeading,2,2));
+    row.setString("estX", nf(dataLog[i].estX,2,2));
+    row.setString("estY", nf(dataLog[i].estY,2,2));
+    row.setString("headingError", nf(dataLog[i].headingError,2,2));
+    row.setString("kfTraceP", nf(dataLog[i].kfTraceP,2,2));
+    row.setString("pfVariance", nf(dataLog[i].pfVariance,2,2));
+    row.setString("icpPairCount", dataLog[i].icpPairCount);
+  }
+
+  let expIndexStr= currentExperimentIndex.toString().padStart(2,'0');
+  saveTable(table, "dataLog_"+expIndexStr+".csv", "csv");
+}
+
+
+// ------------------------------------------------------------
+// Boundary, Ray (기존)
+// ------------------------------------------------------------
+class Boundary {
+  constructor(x1,y1,x2,y2){
+    this.a= createVector(x1,y1);
+    this.b= createVector(x2,y2);
+  }
+  show(){
+    stroke(255);
+    line(this.a.x, this.a.y, this.b.x, this.b.y);
+  }
+}
+
+class Ray {
+  constructor(pos,angle){
+    this.pos= pos;
+    this.dir= p5.Vector.fromAngle(angle);
+  }
+  cast(wall,maxDist){
+    const x1= wall.a.x, y1= wall.a.y;
+    const x2= wall.b.x, y2= wall.b.y;
+    const x3= this.pos.x, y3= this.pos.y;
+    const x4= this.pos.x+ this.dir.x*maxDist, y4= this.pos.y+ this.dir.y*maxDist;
+
+    const den= (x1-x2)*(y3-y4)- (y1-y2)*(x3-x4);
+    if(den===0)return null;
+    const t= ((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/ den;
+    const u= -((x1-x2)*(y1-y3)-(y1-y2)*(x1-x3))/ den;
+    if(t>0 && t<1 && u>0 && u<1){
+      const pt= createVector();
+      pt.x= x1+ t*(x2-x1);
+      pt.y= y1+ t*(y2-y1);
+      return pt;
+    }
+    return null;
+  }
+}
+
+
+// ------------------------------------------------------------
+// Robot
+//   (추가) DR 모션 노이즈, KF R=10, PF sensorSigma=10, ICP inlierThreshold=20
+// ------------------------------------------------------------
+class Robot {
+  constructor(x,y){
+    this.pos= createVector(x,y);
+    this.rays= [];
+    this.heading= 0;
+    this.vel= createVector();
+    this.maxDist= 150;
+    this.colliding= false;
+
+    // 추정 위치
+    this.estimatedPos= createVector(x,y);
+
+    // DR
+    this.estimatedVel_DR= createVector(0,0);
+    // DR 소량 노이즈
+    this.drMotionNoise= 0.1;
+
+    // PF
+    this.particleCount= 1000;
+    this.particles= null;
+
+    // ICP
+    this.lastScanPoints= [];
+    this.tmpICPInlierCount= 0; // inlierCount 저장용
+
+    // 충돌 회피용
+    this.wallAvoidTimer= 0;
+
+    // KF 
+    this.kf= null;
+  }
+
+  update(deltaTimeMS){
+    let dtSec= deltaTimeMS/1000;
+    if(!isFinite(dtSec)|| dtSec<=0) dtSec= 0.016;
+
+    // 회피
+    if(this.wallAvoidTimer>0){
+      this.heading+= 0.03;
+      this.wallAvoidTimer--;
+      this.updateRays();
+      return;
+    }
+
+    let newPos= this.pos.copy();
+
+    if(autoMove){
+      phaseTime+= deltaTimeMS;
+      if(movePhase===0){
+        this.vel= p5.Vector.fromAngle(this.heading);
+        this.vel.setMag(2);
+        newPos.add(this.vel);
+        if(phaseTime>2000){
+          movePhase=1; phaseTime=0;
+        }
+      }
+      else if(movePhase===1){
+        this.heading-= 0.02;
+        if(phaseTime>1000){
+          movePhase=2; phaseTime=0;
+        }
+      }
+      else if(movePhase===2){
+        this.vel= p5.Vector.fromAngle(this.heading);
+        this.vel.setMag(2);
+        newPos.add(this.vel);
+        if(phaseTime>2000){
+          movePhase=0; phaseTime=0;
+        }
+      }
+    } 
+    else {
+      if(keyIsDown(LEFT_ARROW)) this.heading-=0.03;
+      else if(keyIsDown(RIGHT_ARROW)) this.heading+=0.03;
+      if(keyIsDown(UP_ARROW)){
+        this.vel= p5.Vector.fromAngle(this.heading);
+        this.vel.setMag(2);
+        newPos.add(this.vel);
+      }
+      else if(keyIsDown(DOWN_ARROW)){
+        this.vel= p5.Vector.fromAngle(this.heading);
+        this.vel.setMag(-2);
+        newPos.add(this.vel);
+      }
+    }
+
+    let coll= this.collide(newPos);
+    if(coll){
+      this.wallAvoidTimer=60;
+    } else {
+      this.pos= newPos;
+    }
+    this.updateRays();
+  }
+
+  updateRays(){
+    this.rays= [];
+    const resolution= resolutionSlider.value();
+    for(let a=-PI/4; a<= PI/4; a+= radians(resolution)){
+      this.rays.push( new Ray(this.pos, a+ this.heading) );
+    }
+  }
+
+  updateEstimation(algoMode, deltaTimeMS, currentScan){
+    let dt= deltaTimeMS/1000;
+    if(!isFinite(dt)|| dt<=0) dt=0.016;
+
+    switch(algoMode){
+      case 'DR': {
+        // DR+ 노이즈
+        this.estimatedVel_DR= p5.Vector.fromAngle(this.heading);
+        // 소량 노이즈
+        this.estimatedVel_DR.setMag( 2 + randomGaussian(0,this.drMotionNoise) );
+        this.estimatedPos.add( this.estimatedVel_DR.copy().mult(dt*60) );
+        break;
+      }
+
+      case 'KF': {
+        if(!this.kf){
+          this.kf= {
+            x: this.estimatedPos.x,
+            y: this.estimatedPos.y,
+            theta: this.heading,
+            P: [[1,0,0],[0,1,0],[0,0,1]]
+          };
+        }
+        // R=10
+        let R_cov= [[10,0],[0,10]];
+        let Q= [[0.1,0,0],[0,0.1,0],[0,0,0.05]];
+        
+        // 제어 입력
+        let v=0; if(keyIsDown(UP_ARROW))v=2; else if(keyIsDown(DOWN_ARROW))v=-2;
+        let omega=0; if(keyIsDown(LEFT_ARROW))omega=-0.03; else if(keyIsDown(RIGHT_ARROW))omega=0.03;
+
+        let th= this.kf.theta;
+        let pred= {
+          x: this.kf.x + v*dt* Math.cos(th),
+          y: this.kf.y + v*dt* Math.sin(th),
+          theta: th + omega*dt
+        };
+
+        let A= [
+          [1,0, -v*dt* Math.sin(th)],
+          [0,1,  v*dt* Math.cos(th)],
+          [0,0,1]
+        ];
+
+        // P_pred
+        let AP= matMul(A, this.kf.P);
+        let P_pred= matAdd( matMul(AP, matTranspose(A)), Q);
+
+        // 관측
+        let z=null;
+        if(currentScan && currentScan.length>0){
+          let sX=0,sY=0;
+          for(let c of currentScan){ sX+=c.x; sY+=c.y; }
+          let n= currentScan.length;
+          z= {x: sX/n, y: sY/n};
+        }
+        if(z){
+          let H= [[1,0,0],[0,1,0]];
+          // 혁신
+          let hx= [pred.x, pred.y];
+          let inno= { x: z.x- hx[0], y: z.y- hx[1] };
+          // S
+          let HP= matMul(H, P_pred); //2x3
+          let S_2x2= matMul(HP, matTranspose(H));
+          S_2x2[0][0]+= R_cov[0][0];
+          S_2x2[0][1]+= R_cov[0][1];
+          S_2x2[1][0]+= R_cov[1][0];
+          S_2x2[1][1]+= R_cov[1][1];
+          let detS= S_2x2[0][0]* S_2x2[1][1]- S_2x2[0][1]* S_2x2[1][0];
+          if(Math.abs(detS)<1e-9) detS=1e-9;
+          let invS= [
+            [ S_2x2[1][1]/detS, -S_2x2[0][1]/detS ],
+            [ -S_2x2[1][0]/detS, S_2x2[0][0]/detS ]
+          ];
+          // K
+          let PHt= matMul(P_pred, matTranspose(H)); // 3x2
+          let K= matMul(PHt, invS); // 3x2
+
+          let upd= {
+            x: pred.x + (K[0][0]* inno.x + K[0][1]* inno.y),
+            y: pred.y + (K[1][0]* inno.x + K[1][1]* inno.y),
+            theta: pred.theta
+          };
+          // P
+          let KH= matMul(K,H); //3x3
+          let I3= [[1,0,0],[0,1,0],[0,0,1]];
+          let I_KH= matSub(I3, KH);
+          let newP= matMul(I_KH, P_pred);
+
+          this.kf.x= upd.x; this.kf.y= upd.y; this.kf.theta= upd.theta;
+          this.kf.P= newP;
+        } else {
+          this.kf.x= pred.x; this.kf.y= pred.y; this.kf.theta= pred.theta;
+          this.kf.P= P_pred;
+        }
+        this.estimatedPos.x= this.kf.x;
+        this.estimatedPos.y= this.kf.y;
+        break;
+      }
+
+      case 'PF': {
+        if(!this.particles){
+          this.particles= [];
+          for(let i=0;i<this.particleCount;i++){
+            this.particles.push({
+              x: this.estimatedPos.x,
+              y: this.estimatedPos.y,
+              theta: this.heading,
+              weight:1.0
+            });
+          }
+        }
+        // sensorSigma=10
+        let sensorSigma=10;
+
+        let v=0; if(keyIsDown(UP_ARROW)) v=2; else if(keyIsDown(DOWN_ARROW)) v=-2;
+        let omega=0; if(keyIsDown(LEFT_ARROW)) omega=-0.03; else if(keyIsDown(RIGHT_ARROW)) omega=0.03;
+        let dtSec= dt;
+        if(!isFinite(dtSec)|| dtSec<=0) dtSec=0.016;
+
+        const motionNoiseTrans=0.5, motionNoiseRot=0.01;
+        for(let p of this.particles){
+          p.theta+= omega*dtSec + randomGaussian(0,motionNoiseRot);
+          p.x+= v*dtSec* Math.cos(p.theta) + randomGaussian(0,motionNoiseTrans);
+          p.y+= v*dtSec* Math.sin(p.theta) + randomGaussian(0,motionNoiseTrans);
+        }
+
+        if(!currentScan|| currentScan.length<1) break;
+        let sX=0,sY=0;
+        for(let c of currentScan){ sX+= c.x; sY+= c.y; }
+        let n= currentScan.length;
+        let actualC= {x: sX/n, y: sY/n};
+
+        const maxDist=150;
+        function simScan(par){
+          let sc=[];
+          let numSamples=3;
+          for(let i=0;i<numSamples;i++){
+            let a= -PI/4 + i*((PI/2)/(numSamples-1));
+            let rAng= par.theta+ a;
+            let rOri= createVector(par.x,par.y);
+            let rDir= p5.Vector.fromAngle(rAng);
+            let rec= maxDist; let best=null;
+            for(let w of walls){
+              const pt= castRayQuick(rOri,rDir,w,maxDist);
+              if(pt){
+                let dd= p5.Vector.dist(rOri,pt);
+                if(dd<rec){
+                  rec= dd; best= pt;
+                }
+              }
+            }
+            if(best) sc.push(best);
+            else {
+              sc.push(createVector(rOri.x+ rDir.x*maxDist, rOri.y+ rDir.y*maxDist));
+            }
+          }
+          return sc;
+        }
+
+        let wSum=0;
+        for(let p of this.particles){
+          let scn= simScan(p);
+          let sx=0, sy=0;
+          for(let s of scn){ sx+= s.x; sy+= s.y; }
+          let c= {x: sx/scn.length, y: sy/scn.length};
+          let e= dist(c.x, c.y, actualC.x, actualC.y);
+          let w= Math.exp( - (e*e)/(2* sensorSigma* sensorSigma) );
+          p.weight= w; wSum+= w;
+        }
+        if(wSum===0){
+          for(let p of this.particles){
+            p.weight= 1.0/ this.particles.length;
+          }
+        } else {
+          for(let p of this.particles){
+            p.weight/= wSum;
+          }
+        }
+
+        // 리샘플
+        let newP= [];
+        let cumsum=[];
+        let c=0; 
+        for(let p of this.particles){
+          c+= p.weight; cumsum.push(c);
+        }
+        let start= random(0,1/this.particles.length);
+        let idx=0, N= this.particles.length;
+        for(let i=0;i<N;i++){
+          let pos= start+ i/N;
+          while(pos> cumsum[idx]) idx++;
+          newP.push({
+            x:this.particles[idx].x,
+            y:this.particles[idx].y,
+            theta:this.particles[idx].theta,
+            weight:1.0
+          });
+        }
+        this.particles= newP;
+
+        // 평균
+        let mx=0, my=0;
+        for(let p of this.particles){ mx+= p.x; my+= p.y; }
+        mx/= this.particles.length; 
+        my/= this.particles.length;
+        this.estimatedPos.x= lerp(this.estimatedPos.x,mx,0.1);
+        this.estimatedPos.y= lerp(this.estimatedPos.y,my,0.1);
+        break;
+      }
+
+      case 'ICP/GraphSLAM': {
+        // inlierThreshold=20
+        let inlierThreshold=20;
+        if(this.lastScanPoints.length<5|| !currentScan|| currentScan.length<5) break;
+        let maxIter=5;
+        let finalPairs=0;
+        for(let iter=0; iter<maxIter; iter++){
+          let pairs=[];
+          for(let cNow of currentScan){
+            let bestDist= Infinity; let bestPt=null;
+            for(let cOld of this.lastScanPoints){
+              let dd= p5.Vector.dist(cNow,cOld);
+              if(dd< bestDist){
+                bestDist= dd; bestPt= cOld;
+              }
+            }
+            if(bestDist< inlierThreshold){
+              pairs.push({now:cNow, old:bestPt});
+            }
+          }
+          if(pairs.length<5) break;
+          finalPairs= pairs.length;
+
+          let sumN= createVector(0,0), sumO= createVector(0,0);
+          for(let pr of pairs){
+            sumN.add(pr.now); sumO.add(pr.old);
+          }
+          sumN.div(pairs.length);
+          sumO.div(pairs.length);
+
+          let M11=0,M12=0,M21=0,M22=0;
+          for(let pr of pairs){
+            let nowC= p5.Vector.sub(pr.now, sumN);
+            let oldC= p5.Vector.sub(pr.old, sumO);
+            M11+= nowC.x* oldC.x;
+            M12+= nowC.x* oldC.y;
+            M21+= nowC.y* oldC.x;
+            M22+= nowC.y* oldC.y;
+          }
+          let theta= Math.atan2(M21- M12, M11+ M22);
+          this.heading+= theta;
+          let cosT= Math.cos(theta), sinT= Math.sin(theta);
+          let oldP= sumO, newP= sumN;
+          let Rx= cosT* oldP.x - sinT* oldP.y;
+          let Ry= sinT* oldP.x + cosT* oldP.y;
+          let shiftX= newP.x- Rx, shiftY= newP.y- Ry;
+          this.estimatedPos.x+= shiftX;
+          this.estimatedPos.y+= shiftY;
+        }
+        this.tmpICPInlierCount= finalPairs; 
+        break;
+      }
+    }
+    if(currentScan&& currentScan.length>0){
+      this.lastScanPoints= currentScan.slice();
+    }
+  }
+
+  collide(newPos){
+    for(let w of walls){
+      let d= distToSegment(newPos, w.a, w.b);
+      if(d<10) return true;
+    }
+    return false;
+  }
+
+  look(walls){
+    stroke(100,255,100,80);
+    let pts= [];
+    for(let ray of this.rays){
+      let closest=null; let record= this.maxDist;
+      for(let w of walls){
+        let pt= ray.cast(w, this.maxDist);
+        if(pt){
+          let dd= p5.Vector.dist(this.pos, pt);
+          if(dd< record){
+            record= dd; closest= pt;
+          }
+        }
+      }
+      line(
+        this.pos.x, this.pos.y,
+        closest? closest.x: ray.pos.x+ ray.dir.x*this.maxDist,
+        closest? closest.y: ray.pos.y+ ray.dir.y*this.maxDist
+      );
+      if(closest) pts.push(closest);
+    }
+    return pts;
+  }
+
+  show(){
+    fill(this.colliding? 'red': 'white');
+    ellipse(this.pos.x, this.pos.y, 12);
+    stroke(255); strokeWeight(2);
+    line(
+      this.pos.x, this.pos.y,
+      this.pos.x+ Math.cos(this.heading)*20,
+      this.pos.y+ Math.sin(this.heading)*20
+    );
+
+    // 추정 (파랑)
+    push();
+    fill(0,100,255,180);
+    noStroke();
+    ellipse(this.estimatedPos.x, this.estimatedPos.y, 8);
+    pop();
+  }
+}
+
+// PF 내부용
+function castRayQuick(origin, dir, wall, maxDist){
+  const x1=wall.a.x, y1=wall.a.y;
+  const x2=wall.b.x, y2=wall.b.y;
+  const x3= origin.x, y3= origin.y;
+  const x4= origin.x+ dir.x* maxDist, y4= origin.y+ dir.y* maxDist;
+
+  const den= (x1-x2)*(y3-y4)- (y1-y2)*(x3-x4);
+  if(den===0) return null;
+  const t= ((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/ den;
+  const u= -((x1-x2)*(y1-y3)-(y1-y2)*(x1-x3))/ den;
+  if(t>0 && t<1 && u>0 && u<1){
+    let px= x1+ t*(x2-x1);
+    let py= y1+ t*(y2-y1);
+    return createVector(px,py);
+  }
+  return null;
+}
+
+// KF용
+function matMul(A,B){
+  let m= A.length, n= A[0].length, p= B[0].length;
+  let C= new Array(m).fill(0).map(()=> new Array(p).fill(0));
+  for(let i=0;i<m;i++){
+    for(let j=0;j<p;j++){
+      let sum=0;
+      for(let k=0;k<n;k++){
+        sum+= A[i][k]* B[k][j];
+      }
+      C[i][j]= sum;
+    }
+  }
+  return C;
+}
+function matAdd(A,B){
+  let r= A.length, c= A[0].length;
+  let R= new Array(r).fill(0).map(()=> new Array(c).fill(0));
+  for(let i=0;i<r;i++){
+    for(let j=0;j<c;j++){
+      R[i][j]= A[i][j]+ B[i][j];
+    }
+  }
+  return R;
+}
+function matSub(A,B){
+  let r= A.length, c= A[0].length;
+  let R= new Array(r).fill(0).map(()=> new Array(c).fill(0));
+  for(let i=0;i<r;i++){
+    for(let j=0;j<c;j++){
+      R[i][j]= A[i][j]- B[i][j];
+    }
+  }
+  return R;
+}
+function matTranspose(A){
+  let r= A.length, c= A[0].length;
+  let R= new Array(c).fill(0).map(()=> new Array(r).fill(0));
+  for(let i=0;i<r;i++){
+    for(let j=0;j<c;j++){
+      R[j][i]= A[i][j];
+    }
+  }
+  return R;
+}
+function distToSegment(p, v, w){
+  const l2= p5.Vector.dist(v,w)**2;
+  if(l2===0) return p5.Vector.dist(p,v);
+  let t= max(0, min(1, ((p.x-v.x)*(w.x-v.x)+(p.y-v.y)*(w.y-v.y))/ l2));
+  let proj= createVector(v.x+ t*(w.x-v.x), v.y+ t*(w.y-v.y));
+  return p5.Vector.dist(p, proj);
+}
