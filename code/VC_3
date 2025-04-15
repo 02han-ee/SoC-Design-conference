@@ -34,11 +34,21 @@ let dataLog = [];
 // CSV Export 버튼
 let exportButton;
 
+////////////////////////////////////////////////////////////////
+
+let simWidth = 600;       // 왼쪽 시뮬레이션 영역
+let graphWidth = 600;     // 오른쪽 그래프 영역
+
+//////////////////////////////////////////////////////////////////
+
+
+
+
 /***************************************************
  * [자동 이동/자동 실험 실행 관련]
  ***************************************************/
 let autoMove = true;           
-let testDuration = 30000;  // 1분 30초
+let testDuration = 150000;  // 2분 30초
 let startTime = 0;             
 let movePhase = 0;             
 let phaseTime = 0;             
@@ -89,23 +99,25 @@ function buildExperimentList() {
 
 // -------------------------------------------------------------
 function setup() {
-  createCanvas(1200, 600);
+
+  createCanvas(simWidth + graphWidth, 600); /////////////////////////////////////////////////////////////////////////////////////////////////////
 
   // 항상 동일한 벽 랜덤시드를 위해
   randomSeed(0);
 
   // (1) 사각형 테두리 (전체 캔버스 경계)
-  walls.push(new Boundary(0, 0, width, 0));
-  walls.push(new Boundary(width, 0, width, height));
-  walls.push(new Boundary(width, height, 0, height));
+  walls.push(new Boundary(0, 0, simWidth, 0));
+  walls.push(new Boundary(simWidth, 0, simWidth, height));
+  walls.push(new Boundary(simWidth, height, 0, height));
   walls.push(new Boundary(0, height, 0, 0));
 
+
   // (2) 내부에 3개 랜덤 벽
-  for (let i = 0; i < 8; i++) {
-    let x1 = random(200, 1000);
-    let y1 = random(100, 500);
-    let x2 = random(200, 1000);
-    let y2 = random(100, 500);
+  for (let i = 0; i < 5; i++) {
+    let x1 = random(50, simWidth - 50);
+    let y1 = random(50, height - 50);
+    let x2 = random(50, simWidth - 50);
+    let y2 = random(50, height - 50);
     walls.push(new Boundary(x1, y1, x2, y2));
   }
 
@@ -339,7 +351,10 @@ function draw() {
   // (C) 오른쪽 영역에 RMSE 그래프
   //   "rmse" 라벨을 real-time line chart
   //   예: x=620, y=20, w=560, h=250
-  drawRMSEChart(620, 20, 560, 250, dataLog, "rmse");
+  // 시뮬레이션 영역이 600px인 경우라도, 그래프 영역의 너비를 작게 설정하고 시작 위치를 조정
+  drawRMSEChart(simWidth + 20, 300, graphWidth - 40, 250, dataLog, "rmse");
+
+
 
 
 }
@@ -352,22 +367,22 @@ function drawRMSEChart(x, y, w, h, dataArray, property) {
     push();
     translate(x, y);
   
-    // 배경
+    // 배경 그리기
     fill(60);
     noStroke();
     rect(0, 0, w, h);
   
-    // 축 range 대충 0..200 등(또는 data scanning)
-    // 여기선 0..200 임의, 필요시 더 크게
+    // dataArray에서 현재 property 값들의 최대값을 계산 (여기서는 기본값으로 200보다 크면 동적 조정)
+    let maxData = dataArray.reduce((acc, cur) => Math.max(acc, cur[property]), 0);
+    let maxVal = maxData > 200 ? maxData * 1.2 : 200;
     let minVal = 0;
-    let maxVal = 200;
   
     stroke(200);
     strokeWeight(2);
     noFill();
     beginShape();
-    for(let i=0; i<dataArray.length; i++){
-      let px = map(i, 0, dataArray.length-1, 0, w);
+    for (let i = 0; i < dataArray.length; i++) {
+      let px = map(i, 0, dataArray.length - 1, 0, w);
       let py = map(dataArray[i][property], minVal, maxVal, h, 0);
       vertex(px, py);
     }
