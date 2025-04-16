@@ -56,7 +56,10 @@ let phaseTime = 0;
 // [자동 실험] 해상도/알고리즘 순차 실행
 let autoExperiment = true;     
 let resolutions = [1, 5, 10, 15];
-let algorithms = ['DR', 'KF', 'PF', 'ICP/GraphSLAM'];
+
+// let algorithms = ['DR', 'KF', 'PF', 'ICP/GraphSLAM'];
+let algorithms = ['PF'];
+
 let experimentList = [];
 let currentExperimentIndex = 0;
 
@@ -885,91 +888,201 @@ class Robot {
         break;
       }
 
+
       case 'KF': {
-        if(!this.kf){
-          this.kf= {
+        if (!this.kf) {
+          this.kf = {
             x: this.estimatedPos.x,
             y: this.estimatedPos.y,
             theta: this.heading,
-            P: [[1,0,0],[0,1,0],[0,0,1]]
+            P: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
           };
         }
-        // R=10
-        let R_cov= [[10,0],[0,10]];
-        let Q= [[0.1,0,0],[0,0.1,0],[0,0,0.05]];
-        
-        // 제어 입력
-        let v=0; if(keyIsDown(UP_ARROW))v=2; else if(keyIsDown(DOWN_ARROW))v=-2;
-        let omega=0; if(keyIsDown(LEFT_ARROW))omega=-0.03; else if(keyIsDown(RIGHT_ARROW))omega=0.03;
+        // Measurement noise (R)와 process noise (Q)는 튜닝 값
+        let R_cov = [[10, 0], [0, 10]];
+        let Q = [[0.1, 0, 0], [0, 0.1, 0], [0, 0, 0.05]];
 
-        let th= this.kf.theta;
-        let pred= {
-          x: this.kf.x + v*dt* Math.cos(th),
-          y: this.kf.y + v*dt* Math.sin(th),
-          theta: th + omega*dt
+        // 제어 입력: 키 상태로부터 선형 속도 v와 회전 속도 omega 결정
+        let v = 0; 
+        if (keyIsDown(UP_ARROW)) v = 2;
+        else if (keyIsDown(DOWN_ARROW)) v = -2;
+        let omega = 0;
+        if (keyIsDown(LEFT_ARROW)) omega = -0.03;
+        else if (keyIsDown(RIGHT_ARROW)) omega = 0.03;
+
+        let th = this.kf.theta;
+        let pred = {
+          x: this.kf.x + v * dt * Math.cos(th),
+          y: this.kf.y + v * dt * Math.sin(th),
+          theta: th + omega * dt
         };
 
-        let A= [
-          [1,0, -v*dt* Math.sin(th)],
-          [0,1,  v*dt* Math.cos(th)],
-          [0,0,1]
+        // 상태 전파 행렬 A (선형화)
+        let A = [
+          [1, 0, -v * dt * Math.sin(th)],
+          [0, 1,  v * dt * Math.cos(th)],
+          [0, 0, 1]
         ];
 
-        // P_pred
-        let AP= matMul(A, this.kf.P);
-        let P_pred= matAdd( matMul(AP, matTranspose(A)), Q);
+        // 예측 공분산: P_pred = A * P * A^T + Q
+        let AP = matMul(A, this.kf.P);
+        let P_pred = matAdd(matMul(AP, matTranspose(A)), Q);
 
-        // 관측
-        let z=null;
-        if(currentScan && currentScan.length>0){
-          let sX=0,sY=0;
-          for(let c of currentScan){ sX+=c.x; sY+=c.y; }
-          let n= currentScan.length;
-          z= {x: sX/n, y: sY/n};
+        // 관측 단계: 현재 스캔의 centroid (x,y) 계산
+        let z = null;
+        if (currentScan && currentScan.length > 0) {
+          let sX = 0, sY = 0;
+          for (let c of currentScan) {
+            sX += c.x;
+            sY += c.y;
+          }
+          let n = currentScan.length;
+          z = { x: sX / n, y: sY / n };
         }
-        if(z){
-          let H= [[1,0,0],[0,1,0]];
-          // 혁신
-          let hx= [pred.x, pred.y];
-          let inno= { x: z.x- hx[0], y: z.y- hx[1] };
-          // S
-          let HP= matMul(H, P_pred); //2x3
-          let S_2x2= matMul(HP, matTranspose(H));
-          S_2x2[0][0]+= R_cov[0][0];
-          S_2x2[0][1]+= R_cov[0][1];
-          S_2x2[1][0]+= R_cov[1][0];
-          S_2x2[1][1]+= R_cov[1][1];
-          let detS= S_2x2[0][0]* S_2x2[1][1]- S_2x2[0][1]* S_2x2[1][0];
-          if(Math.abs(detS)<1e-9) detS=1e-9;
-          let invS= [
-            [ S_2x2[1][1]/detS, -S_2x2[0][1]/detS ],
-            [ -S_2x2[1][0]/detS, S_2x2[0][0]/detS ]
+
+        if (z) {
+          let H = [[1, 0, 0], [0, 1, 0]];  // 관측 행렬: 상태에서 x,y만 관측
+          // 혁신: 실제 측정 z와 예측치 H*pred의 차이
+          let hx = [pred.x, pred.y];
+          let inno = { x: z.x - hx[0], y: z.y - hx[1] };
+
+          // S = H * P_pred * H^T + R
+          let HP = matMul(H, P_pred); // 2x3
+          let S_2x2 = matMul(HP, matTranspose(H));  // 2x2
+          S_2x2[0][0] += R_cov[0][0];
+          S_2x2[0][1] += R_cov[0][1];
+          S_2x2[1][0] += R_cov[1][0];
+          S_2x2[1][1] += R_cov[1][1];
+          let detS = S_2x2[0][0] * S_2x2[1][1] - S_2x2[0][1] * S_2x2[1][0];
+          if (Math.abs(detS) < 1e-9) detS = 1e-9;
+          let invS = [
+            [ S_2x2[1][1] / detS, -S_2x2[0][1] / detS ],
+            [ -S_2x2[1][0] / detS, S_2x2[0][0] / detS ]
           ];
-          // K
-          let PHt= matMul(P_pred, matTranspose(H)); // 3x2
-          let K= matMul(PHt, invS); // 3x2
+          // Kalman Gain: K = P_pred * H^T * inv(S)
+          let PHt = matMul(P_pred, matTranspose(H)); // 3x2
+          let K = matMul(PHt, invS); // 3x2
 
-          let upd= {
-            x: pred.x + (K[0][0]* inno.x + K[0][1]* inno.y),
-            y: pred.y + (K[1][0]* inno.x + K[1][1]* inno.y),
-            theta: pred.theta
+          // KF 상태 업데이트
+          let upd = {
+            x: pred.x + (K[0][0] * inno.x + K[0][1] * inno.y),
+            y: pred.y + (K[1][0] * inno.x + K[1][1] * inno.y),
+            theta: pred.theta  // 측정이 없으므로 theta는 예측값 유지
           };
-          // P
-          let KH= matMul(K,H); //3x3
-          let I3= [[1,0,0],[0,1,0],[0,0,1]];
-          let I_KH= matSub(I3, KH);
-          let newP= matMul(I_KH, P_pred);
 
-          this.kf.x= upd.x; this.kf.y= upd.y; this.kf.theta= upd.theta;
-          this.kf.P= newP;
+          // Joseph form을 이용한 공분산 업데이트:  
+          //   newP = (I - K*H)*P_pred*(I - K*H)^T + K*R*K^T
+          let I3 = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+          let KH = matMul(K, H);  // 3x3
+          let I_minus_KH = matSub(I3, KH);
+          let P_temp = matMul(I_minus_KH, P_pred);
+          let newP = matAdd(matMul(P_temp, matTranspose(I_minus_KH)), matMul(matMul(K, R_cov), matTranspose(K)));
+
+          this.kf.x = upd.x;
+          this.kf.y = upd.y;
+          this.kf.theta = upd.theta;
+          this.kf.P = newP;
         } else {
-          this.kf.x= pred.x; this.kf.y= pred.y; this.kf.theta= pred.theta;
-          this.kf.P= P_pred;
+          this.kf.x = pred.x;
+          this.kf.y = pred.y;
+          this.kf.theta = pred.theta;
+          this.kf.P = P_pred;
         }
-        this.estimatedPos.x= this.kf.x;
-        this.estimatedPos.y= this.kf.y;
+        this.estimatedPos.x = this.kf.x;
+        this.estimatedPos.y = this.kf.y;
         break;
-      }
+     }
+
+
+
+
+
+    //   case 'KF': {
+    //     if(!this.kf){
+    //       this.kf= {
+    //         x: this.estimatedPos.x,
+    //         y: this.estimatedPos.y,
+    //         theta: this.heading,
+    //         P: [[1,0,0],[0,1,0],[0,0,1]]
+    //       };
+    //     }
+    //     // R=10
+    //     let R_cov= [[10,0],[0,10]];
+    //     let Q= [[0.1,0,0],[0,0.1,0],[0,0,0.05]];
+        
+    //     // 제어 입력
+    //     let v=0; if(keyIsDown(UP_ARROW))v=2; else if(keyIsDown(DOWN_ARROW))v=-2;
+    //     let omega=0; if(keyIsDown(LEFT_ARROW))omega=-0.03; else if(keyIsDown(RIGHT_ARROW))omega=0.03;
+
+    //     let th= this.kf.theta;
+    //     let pred= {
+    //       x: this.kf.x + v*dt* Math.cos(th),
+    //       y: this.kf.y + v*dt* Math.sin(th),
+    //       theta: th + omega*dt
+    //     };
+
+    //     let A= [
+    //       [1,0, -v*dt* Math.sin(th)],
+    //       [0,1,  v*dt* Math.cos(th)],
+    //       [0,0,1]
+    //     ];
+
+    //     // P_pred
+    //     let AP= matMul(A, this.kf.P);
+    //     let P_pred= matAdd( matMul(AP, matTranspose(A)), Q);
+
+    //     // 관측
+    //     let z=null;
+    //     if(currentScan && currentScan.length>0){
+    //       let sX=0,sY=0;
+    //       for(let c of currentScan){ sX+=c.x; sY+=c.y; }
+    //       let n= currentScan.length;
+    //       z= {x: sX/n, y: sY/n};
+    //     }
+    //     if(z){
+    //       let H= [[1,0,0],[0,1,0]];
+    //       // 혁신
+    //       let hx= [pred.x, pred.y];
+    //       let inno= { x: z.x- hx[0], y: z.y- hx[1] };
+    //       // S
+    //       let HP= matMul(H, P_pred); //2x3
+    //       let S_2x2= matMul(HP, matTranspose(H));
+    //       S_2x2[0][0]+= R_cov[0][0];
+    //       S_2x2[0][1]+= R_cov[0][1];
+    //       S_2x2[1][0]+= R_cov[1][0];
+    //       S_2x2[1][1]+= R_cov[1][1];
+    //       let detS= S_2x2[0][0]* S_2x2[1][1]- S_2x2[0][1]* S_2x2[1][0];
+    //       if(Math.abs(detS)<1e-9) detS=1e-9;
+    //       let invS= [
+    //         [ S_2x2[1][1]/detS, -S_2x2[0][1]/detS ],
+    //         [ -S_2x2[1][0]/detS, S_2x2[0][0]/detS ]
+    //       ];
+    //       // K
+    //       let PHt= matMul(P_pred, matTranspose(H)); // 3x2
+    //       let K= matMul(PHt, invS); // 3x2
+
+    //       let upd= {
+    //         x: pred.x + (K[0][0]* inno.x + K[0][1]* inno.y),
+    //         y: pred.y + (K[1][0]* inno.x + K[1][1]* inno.y),
+    //         theta: pred.theta
+    //       };
+    //       // P
+    //       let KH= matMul(K,H); //3x3
+    //       let I3= [[1,0,0],[0,1,0],[0,0,1]];
+    //       let I_KH= matSub(I3, KH);
+    //       let newP= matMul(I_KH, P_pred);
+
+    //       this.kf.x= upd.x; this.kf.y= upd.y; this.kf.theta= upd.theta;
+    //       this.kf.P= newP;
+    //     } else {
+    //       this.kf.x= pred.x; this.kf.y= pred.y; this.kf.theta= pred.theta;
+    //       this.kf.P= P_pred;
+    //     }
+    //     this.estimatedPos.x= this.kf.x;
+    //     this.estimatedPos.y= this.kf.y;
+    //     break;
+    //   }
+
 
       case 'PF': {
         if(!this.particles){
@@ -1082,58 +1195,136 @@ class Robot {
         break;
       }
 
+
+
+
+
       case 'ICP/GraphSLAM': {
-        // inlierThreshold=20
-        let inlierThreshold=20;
-        if(this.lastScanPoints.length<5|| !currentScan|| currentScan.length<5) break;
-        let maxIter=5;
-        let finalPairs=0;
-        for(let iter=0; iter<maxIter; iter++){
-          let pairs=[];
-          for(let cNow of currentScan){
-            let bestDist= Infinity; let bestPt=null;
-            for(let cOld of this.lastScanPoints){
-              let dd= p5.Vector.dist(cNow,cOld);
-              if(dd< bestDist){
-                bestDist= dd; bestPt= cOld;
-              }
-            }
-            if(bestDist< inlierThreshold){
-              pairs.push({now:cNow, old:bestPt});
+        // inlierThreshold (픽셀 단위)
+        let inlierThreshold = 20;
+        if (this.lastScanPoints.length < 5 || !currentScan || currentScan.length < 5) break;
+        
+        // 1) 모든 현재 스캔 점에 대해, 가장 가까운 이전 스캔 점을 찾고, inlier 조건(오차 < inlierThreshold)을 만족하는 쌍을 저장
+        let pairs = [];
+        for (let pNow of currentScan) {
+          let bestDist = Infinity;
+          let bestPt = null;
+          for (let pOld of this.lastScanPoints) {
+            let dd = p5.Vector.dist(pNow, pOld);
+            if (dd < bestDist) {
+              bestDist = dd;
+              bestPt = pOld;
             }
           }
-          if(pairs.length<5) break;
-          finalPairs= pairs.length;
-
-          let sumN= createVector(0,0), sumO= createVector(0,0);
-          for(let pr of pairs){
-            sumN.add(pr.now); sumO.add(pr.old);
+          if (bestDist < inlierThreshold) {
+            pairs.push({ now: pNow, old: bestPt });
           }
-          sumN.div(pairs.length);
-          sumO.div(pairs.length);
-
-          let M11=0,M12=0,M21=0,M22=0;
-          for(let pr of pairs){
-            let nowC= p5.Vector.sub(pr.now, sumN);
-            let oldC= p5.Vector.sub(pr.old, sumO);
-            M11+= nowC.x* oldC.x;
-            M12+= nowC.x* oldC.y;
-            M21+= nowC.y* oldC.x;
-            M22+= nowC.y* oldC.y;
-          }
-          let theta= Math.atan2(M21- M12, M11+ M22);
-          this.heading+= theta;
-          let cosT= Math.cos(theta), sinT= Math.sin(theta);
-          let oldP= sumO, newP= sumN;
-          let Rx= cosT* oldP.x - sinT* oldP.y;
-          let Ry= sinT* oldP.x + cosT* oldP.y;
-          let shiftX= newP.x- Rx, shiftY= newP.y- Ry;
-          this.estimatedPos.x+= shiftX;
-          this.estimatedPos.y+= shiftY;
         }
-        this.tmpICPInlierCount= finalPairs; 
+        if (pairs.length < 5) break;
+        
+        // 2) RANSAC 기반으로 초기 후보 변환 (회전 및 translation) 추정
+        let bestInlierCount = 0;
+        let bestCandidate = null;
+        const iterations = 10;
+        for (let iter = 0; iter < iterations; iter++) {
+          // 랜덤하게 2개의 서로 다른 매칭 쌍 선택
+          let idx1 = floor(random(pairs.length));
+          let idx2 = floor(random(pairs.length));
+          if (idx1 === idx2) continue;
+          let sample1 = pairs[idx1];
+          let sample2 = pairs[idx2];
+          
+          // 선택된 두 쌍의 현재 스캔 점과 이전 스캔 점의 중심(centroid) 계산
+          let centroidNow = createVector((sample1.now.x + sample2.now.x) / 2, (sample1.now.y + sample2.now.y) / 2);
+          let centroidOld = createVector((sample1.old.x + sample2.old.x) / 2, (sample1.old.y + sample2.old.y) / 2);
+          
+          // 한 쌍의 차이를 이용하여 회전각 후보 계산
+          let vecNow = p5.Vector.sub(sample1.now, centroidNow);
+          let vecOld = p5.Vector.sub(sample1.old, centroidOld);
+          let thetaCandidate = Math.atan2(vecNow.y, vecNow.x) - Math.atan2(vecOld.y, vecOld.x);
+          
+          // 이전 중심(centroid)을 회전시키고 translation 후보 계산
+          let cosT = Math.cos(thetaCandidate), sinT = Math.sin(thetaCandidate);
+          let rotatedOldCentroid = createVector(
+            cosT * centroidOld.x - sinT * centroidOld.y,
+            sinT * centroidOld.x + cosT * centroidOld.y
+          );
+          let translationCandidate = p5.Vector.sub(centroidNow, rotatedOldCentroid);
+          
+          // 이 후보 변환을 모든 쌍에 적용하여 inlier 수 계산
+          let inlierCount = 0;
+          for (let pair of pairs) {
+            let transformed = createVector(
+              cosT * pair.old.x - sinT * pair.old.y + translationCandidate.x,
+              sinT * pair.old.x + cosT * pair.old.y + translationCandidate.y
+            );
+            let error = p5.Vector.dist(transformed, pair.now);
+            if (error < inlierThreshold) {
+              inlierCount++;
+            }
+          }
+          if (inlierCount > bestInlierCount) {
+            bestInlierCount = inlierCount;
+            bestCandidate = { theta: thetaCandidate, translation: translationCandidate.copy() };
+          }
+        }
+        
+        // 3) 후보 변환(bestCandidate)을 기반으로 inlier들을 다시 선택한 후, SVD(유사한) 방식으로 정밀 보정 수행
+        if (bestCandidate) {
+          let cosT = Math.cos(bestCandidate.theta), sinT = Math.sin(bestCandidate.theta);
+          let inliers = [];
+          for (let pair of pairs) {
+            let transformed = createVector(
+              cosT * pair.old.x - sinT * pair.old.y + bestCandidate.translation.x,
+              sinT * pair.old.x + cosT * pair.old.y + bestCandidate.translation.y
+            );
+            let error = p5.Vector.dist(transformed, pair.now);
+            if (error < inlierThreshold) {
+              inliers.push(pair);
+            }
+          }
+          
+          if (inliers.length >= 5) {
+            // 모든 inlier 쌍에 대해 중심 계산
+            let centroidNow = createVector(0, 0);
+            let centroidOld = createVector(0, 0);
+            for (let pair of inliers) {
+              centroidNow.add(pair.now);
+              centroidOld.add(pair.old);
+            }
+            centroidNow.div(inliers.length);
+            centroidOld.div(inliers.length);
+            
+            // 공분산 행렬 계산
+            let M11 = 0, M12 = 0, M21 = 0, M22 = 0;
+            for (let pair of inliers) {
+              let diffNow = p5.Vector.sub(pair.now, centroidNow);
+              let diffOld = p5.Vector.sub(pair.old, centroidOld);
+              M11 += diffNow.x * diffOld.x;
+              M12 += diffNow.x * diffOld.y;
+              M21 += diffNow.y * diffOld.x;
+              M22 += diffNow.y * diffOld.y;
+            }
+            // 회전각 추정 (ICP 2D 공식)
+            let refinedTheta = Math.atan2(M21 - M12, M11 + M22);
+            
+            // 정밀 translation 계산: 이전 중심을 회전시켜 현재 중심과의 차이
+            let cosRef = Math.cos(refinedTheta), sinRef = Math.sin(refinedTheta);
+            let rotatedOldCentroid = createVector(
+              cosRef * centroidOld.x - sinRef * centroidOld.y,
+              sinRef * centroidOld.x + cosRef * centroidOld.y
+            );
+            let refinedTranslation = p5.Vector.sub(centroidNow, rotatedOldCentroid);
+            
+            // 적용: refined transformation을 현재 상태에 적용
+            this.heading += refinedTheta;
+            this.estimatedPos.x += refinedTranslation.x;
+            this.estimatedPos.y += refinedTranslation.y;
+          }
+        }
         break;
       }
+
     }
     if(currentScan&& currentScan.length>0){
       this.lastScanPoints= currentScan.slice();
@@ -1262,3 +1453,4 @@ function distToSegment(p, v, w){
   let proj= createVector(v.x+ t*(w.x-v.x), v.y+ t*(w.y-v.y));
   return p5.Vector.dist(p, proj);
 }
+
