@@ -1,0 +1,423 @@
+# -*- coding: utf‑8 -*-
+"""
+p5.js 시뮬레이터(시각화 제외)의 1:1 파이썬 이식본
+ ‑ FPS / RMSE / Power,  DR·KF·PF·ICP 알고리즘 완전 구현
+"""
+import math, random, csv, time
+from collections import deque
+import numpy as np
+try:
+    import cupy as cp
+    xp = cp
+    use_gpu = True
+except ImportError:
+    import numpy as cp  # 별칭
+    xp = np
+    use_gpu = False
+
+
+###############################################################################
+# 전역 파라미터
+###############################################################################
+SIM_W, SIM_H = 600, 600
+MAX_DIST      = 150.
+BASE_POWER    = 5.0
+RAY_COST      = 0.05
+PF_COST       = 0.3
+ICP_COST      = 0.6
+MAX_POINTS    = 3000
+WINDOW_SIZE   = 30
+WARMUP_FRAMES = 50
+EXP_ALPHA     = 0.1
+TEST_DURATION = 150_000          # ms
+FPS_SMOOTH    = .9
+
+# 자동 실험 순서
+RESOLUTIONS = [1, 5, 10, 15]
+# ALGORITHMS  = ['DR', 'KF', 'PF', 'ICP']   # ‑‑ 여기를 채움
+
+ALGORITHMS  = ['DR', 'KF', 'PF', 'ICP']
+
+
+random.seed(0)
+
+###############################################################################
+# 기하 헬퍼
+###############################################################################
+def dist(p, q):      return math.hypot(p[0]-q[0], p[1]-q[1])
+def angle_diff(a,b):
+    d=(a-b)%(2*math.pi)
+    if d>math.pi: d-=2*math.pi
+    if d<-math.pi:d+=2*math.pi
+    return d
+
+def invert2x2(M):
+    det = M[0][0]*M[1][1]-M[0][1]*M[1][0]
+    if abs(det)<1e-9: return np.array([[9e9,0],[0,9e9]])
+    return np.array([[ M[1][1]/det, -M[0][1]/det],
+                     [ -M[1][0]/det,  M[0][0]/det]])
+
+###############################################################################
+# 월, 레이
+###############################################################################
+class Boundary:
+    def __init__(s,x1,y1,x2,y2):
+        s.a=(x1,y1); s.b=(x2,y2)
+
+class Ray:
+    def __init__(s, pos, ang):
+        s.ox,s.oy=pos;  s.dx=math.cos(ang); s.dy=math.sin(ang)
+
+    def cast(s, wall):
+        x1,y1 = wall.a;  x2,y2 = wall.b
+        x3,y3 = s.ox, s.oy
+        x4,y4 = s.ox+s.dx*MAX_DIST, s.oy+s.dy*MAX_DIST
+        den = (x1-x2)*(y3-y4)-(y1-y2)*(x3-x4)
+        if den==0: return None
+        t = ((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/den
+        u = -((x1-x2)*(y1-y3)-(y1-y2)*(x1-x3))/den
+        if 0<t<1 and 0<u<1:
+            px = x1+t*(x2-x1);  py = y1+t*(y2-y1)
+            return (px,py)
+        return None
+
+###############################################################################
+# 로봇
+###############################################################################
+class Robot:
+    def __init__(s,x,y,res):
+        s.pos   = np.array([x,y],float)
+        s.heading=0.0
+        s.vel=np.zeros(2)
+        s.resolution=res
+        s.update_rays()
+
+        s.estimated = np.array([x,y],float)
+        s.kf=None
+        s.particles=None
+        s.last_scan=[]
+        s.tmp_icp_inlier=0
+        s.dr_noise=0.1
+        s.wall_avoid=0
+
+    def update_rays(s):
+        s.rays=[]
+        ang=-math.pi/4
+        while ang<=math.pi/4+1e-6:
+            s.rays.append(Ray(s.pos, ang+s.heading))
+            ang+= math.radians(s.resolution)
+
+    # 벽 충돌 단순 검사
+    def collide(s,new,walls):
+        for w in walls:
+            d = seg_dist(new, w.a, w.b)
+            if d<10: return True
+        return False
+
+    def move(s,dt,walls):
+        if s.wall_avoid>0:
+            s.heading+=0.03
+            s.wall_avoid-=1
+            s.update_rays();  return
+
+        # 간단 순환 움직임(자동)
+        s.vel = np.array([math.cos(s.heading), math.sin(s.heading)])*2
+        new = s.pos + s.vel*dt*60
+        if s.collide(new,walls):
+            s.wall_avoid=60
+        else:
+            s.pos=new
+        s.update_rays()
+
+    def scan(s,walls):
+        pts=[]
+        for r in s.rays:
+            best=None; rec=MAX_DIST
+            for w in walls:
+                p=r.cast(w)
+                if p:
+                    d=dist(p,s.pos)
+                    if d<rec: rec=d; best=p
+            if best: pts.append(best)
+        return pts
+
+    ###########################################################################
+    # 추정  (ALGO: DR / KF / PF / ICP)
+    ###########################################################################
+    def estimate(s, algo, dt, scan, walls, frame):
+
+        # Dead‑Reckoning -------------------------------------------------------
+        if algo=='DR':
+            v = np.array([math.cos(s.heading), math.sin(s.heading)])\
+                *(2+random.gauss(0,s.dr_noise))
+            s.estimated += v*dt*60
+            return
+
+        # Kalman Filter --------------------------------------------------------
+
+
+
+         # --- Kalman Filter 부분만 교체 ---------------------------------------------
+        if algo == 'KF':
+            if s.kf is None:
+                s.kf = {'x': s.estimated.copy(),
+                    'th': s.heading,
+                    'P': np.eye(3)}
+            kf = s.kf
+            v, omega = 2, 0
+            th = kf['th']
+            pred_x  = kf['x'] + np.array([v*dt*math.cos(th),
+                                   v*dt*math.sin(th)])
+            pred_th = th + omega*dt
+
+            A = np.array([[1, 0, -v*dt*math.sin(th)],
+                  [0, 1,  v*dt*math.cos(th)],
+                  [0, 0,  1]])
+            Q = np.diag([.1, .1, .05])
+            P_pred = A @ kf['P'] @ A.T + Q
+
+            # --- 측정 z : 스캔의 중심점 -------------------------------------------
+            z = None
+            if scan:
+                sx = sum(p[0] for p in scan) / len(scan)
+                sy = sum(p[1] for p in scan) / len(scan)
+                z  = np.array([sx, sy])
+
+            if z is not None:
+                H = np.array([[1, 0, 0],
+                      [0, 1, 0]])
+                R = np.diag([10, 10])
+
+                x_pred_full = np.array([pred_x[0], pred_x[1], pred_th])
+                y  = z - (H @ x_pred_full)                 # ← 괄호 추가!
+                S  = H @ P_pred @ H.T + R
+                K  = P_pred @ H.T @ np.linalg.inv(S)       # (3×2)
+
+                x_upd = x_pred_full + K @ y                # 3‑vector
+                kf['x']  = x_upd[:2]
+                kf['th'] = x_upd[2]
+                kf['P']  = (np.eye(3) - K @ H) @ P_pred
+            else:
+                kf['x']  = pred_x
+                kf['th'] = pred_th
+                kf['P']  = P_pred
+
+            s.estimated = kf['x'].copy()
+            return
+# ---------------------------------------------------------------------------
+
+
+
+
+        # Particle Filter ------------------------------------------------------
+        if algo=='PF':
+            N=200
+            if s.particles is None:
+                s.particles=[{'x':s.estimated[0],'y':s.estimated[1],
+                              'th':s.heading,'w':1/N} for _ in range(N)]
+
+            v,omega = 0.2,0
+            for p in s.particles:
+                p['th']+= omega*dt + random.gauss(0,0.002)
+                p['x'] += v*dt*math.cos(p['th']) + random.gauss(0,0.002)
+                p['y'] += v*dt*math.sin(p['th']) + random.gauss(0,0.002)
+
+                #sigma_xy = 0.2 + 0.3*math.exp(-frame/2000)   # 초반엔 넉넉하게, 점차 줄여주는 형태
+                #p['x'] += v*dt*math.cos(p['th']) + random.gauss(0,sigma_xy)
+                #p['y'] += v*dt*math.sin(p['th']) + random.gauss(0,sigma_xy)
+
+            if not scan: return
+            ax=sum(p[0] for p in scan)/len(scan)
+            ay=sum(p[1] for p in scan)/len(scan)
+            sigma=5
+            wsum=0
+            for p in s.particles:
+                # fake scan centroid (3‑ray)
+                cx=cy=0
+                #for ang in [-math.pi/4,0,math.pi/4]:
+                for ang in [-math.pi/4, -math.pi/8, 0, math.pi/8, math.pi/4]:
+                    dir=(math.cos(p['th']+ang), math.sin(p['th']+ang))
+                    best=None; rec=MAX_DIST
+                    for w in walls:
+                        q=cast_quick((p['x'],p['y']),dir,w)
+                        if q:
+                            d=dist((p['x'],p['y']),q)
+                            if d<rec: rec=d; best=q
+                    if best: cx+=best[0]; cy+=best[1]
+                    else:
+                        cx+=p['x']+dir[0]*MAX_DIST
+                        cy+=p['y']+dir[1]*MAX_DIST
+                cx/=3; cy/=3
+                err=dist((cx,cy),(ax,ay))
+                p['w']=math.exp(-(err**2)/(2*sigma**2))
+                wsum+=p['w']
+            if wsum==0:
+                for p in s.particles: p['w']=1/N
+            else:
+                for p in s.particles: p['w']/=wsum
+
+
+
+            # 낮은 분산 resampling
+      #      newP=[]; idx=int(random.random()*N)
+      #      beta=0; mw=max(p['w'] for p in s.particles)
+      #      for _ in range(N):
+      #          beta+=random.random()*2*mw
+      #          while beta> s.particles[idx]['w']:
+      #              beta-=s.particles[idx]['w']
+      #              idx=(idx+1)%N
+      #          newP.append(s.particles[idx].copy())
+      #      s.particles=newP
+
+                # ← 여기서 ESS 체크
+            ess = 1.0 / sum(p['w']**2 for p in s.particles)
+            if ess < 0.2 * N:
+                # Low-variance resampling
+                newP=[]; idx=int(random.random()*N)
+                beta=0; mw=max(p['w'] for p in s.particles)
+                for _ in range(N):
+                  beta += random.random() * 2 * mw
+                  while beta > s.particles[idx]['w']:
+                    beta -= s.particles[idx]['w']
+                    idx = (idx+1) % N
+                  newP.append(s.particles[idx].copy())
+                s.particles = newP
+
+
+
+
+            mx=my=0
+            for p in s.particles:
+                mx+=p['x']; my+=p['y']
+            s.estimated=np.array([mx/N,my/N])
+            return
+
+        # ICP / GraphSLAM ------------------------------------------------------
+        if algo=='ICP':
+            if len(s.last_scan)<5 or len(scan)<5:
+                s.last_scan=scan[:] ; return
+            inlier_th = 15
+
+            max_iter   = 15
+
+            pairs=[]
+            for pn in scan:
+                best=None; bestd=1e9
+                for po in s.last_scan:
+                    d=dist(pn,po)
+                    if d<bestd:
+                        bestd=d; best=po
+                if bestd<inlier_th: pairs.append((pn,best))
+            #if len(pairs)<5:
+            if len(pairs) < max(6, int(0.2*len(pairs))):
+
+                s.last_scan=scan[:] ; return
+
+            best=None; best_inliers=0
+            for _ in range(max_iter):
+                i1,i2=random.sample(range(len(pairs)),2)
+                n1,o1=pairs[i1]; n2,o2=pairs[i2]
+                cn=((n1[0]+n2[0])/2,(n1[1]+n2[1])/2)
+                co=((o1[0]+o2[0])/2,(o1[1]+o2[1])/2)
+                vn=(n1[0]-cn[0], n1[1]-cn[1])
+                vo=(o1[0]-co[0], o1[1]-co[1])
+                th = math.atan2(vn[1],vn[0]) - math.atan2(vo[1],vo[0])
+                c,sn = math.cos(th), math.sin(th)
+                rot_co=(c*co[0]-sn*co[1], sn*co[0]+c*co[1])
+                trans=(cn[0]-rot_co[0], cn[1]-rot_co[1])
+
+                inliers=0
+                for pn,po in pairs:
+                    rx=c*po[0]-sn*po[1]+trans[0]
+                    ry=sn*po[0]+c*po[1]+trans[1]
+                    if dist((rx,ry),pn)<inlier_th: inliers+=1
+                if inliers>best_inliers:
+                    best_inliers=inliers; best=(th,trans)
+
+            if best:
+                th,trans=best; c,sn=math.cos(th),math.sin(th)
+                s.heading+=th
+                s.estimated += np.array(trans)
+            s.last_scan=scan[:]
+            return
+
+###############################################################################
+# 유틸
+###############################################################################
+def seg_dist(p, a, b):
+    # p, a, b 는 (x,y)
+    l2 = dist(a,b)**2
+    if l2==0: return dist(p,a)
+    t=max(0,min(1, ((p[0]-a[0])*(b[0]-a[0])+(p[1]-a[1])*(b[1]-a[1]))/l2))
+    proj=(a[0]+t*(b[0]-a[0]), a[1]+t*(b[1]-a[1]))
+    return dist(p,proj)
+
+def cast_quick(o, d, w):
+    x1,y1=w.a; x2,y2=w.b
+    x3,y3=o;   x4,y4=o[0]+d[0]*MAX_DIST, o[1]+d[1]*MAX_DIST
+    den=(x1-x2)*(y3-y4)-(y1-y2)*(x3-x4)
+    if den==0: return None
+    t=((x1-x3)*(y3-y4)-(y1-y3)*(x3-x4))/den
+    u=-((x1-x2)*(y1-y3)-(y1-y2)*(x1-x3))/den
+    if 0<t<1 and 0<u<1:
+        return (x1+t*(x2-x1), y1+t*(y2-y1))
+    return None
+
+###############################################################################
+# 시뮬레이션
+###############################################################################
+def build_walls():
+    walls=[]
+    walls.append(Boundary(0,0,SIM_W,0))
+    walls.append(Boundary(SIM_W,0,SIM_W,SIM_H))
+    walls.append(Boundary(SIM_W,SIM_H,0,SIM_H))
+    walls.append(Boundary(0,SIM_H,0,0))
+    for _ in range(5):
+        x1=random.uniform(50,SIM_W-50)
+        y1=random.uniform(50,SIM_H-50)
+        x2=random.uniform(50,SIM_W-50)
+        y2=random.uniform(50,SIM_H-50)
+        walls.append(Boundary(x1,y1,x2,y2))
+    return walls
+
+def run_experiment(res, algo):
+    walls=build_walls()
+    bot=Robot(SIM_W/4,SIM_H/2,res)
+    start=time.time()*1000
+    last = time.time()*1000
+    frame=0
+    csv_rows=[]
+    sum_sq=0
+    while (time.time()*1000 - start) < TEST_DURATION:
+        now=time.time()*1000
+        dt=(now-last)/1000
+        last=now
+        frame+=1
+
+        bot.move(dt,walls)
+        scan=bot.scan(walls)
+        bot.estimate(algo,dt,scan,walls, frame)
+
+        dx,dy=bot.pos-bot.estimated
+        sum_sq+=dx*dx+dy*dy
+        rmse=math.sqrt(sum_sq/frame)
+
+        rays=len(bot.rays)
+        power=BASE_POWER + rays*RAY_COST
+        if algo=='PF': power+= rays*PF_COST
+        elif algo=='ICP': power+= rays*ICP_COST
+
+        csv_rows.append([frame, rmse, power, res, algo,
+                         bot.pos[0],bot.pos[1], bot.estimated[0],bot.estimated[1]])
+    fn=f"dataLog_{algo}_{res}.csv"
+    with open(fn,'w',newline='') as f:
+        w=csv.writer(f)
+        w.writerow(['frame','rmse','power','resolution','algo',
+                    'trueX','trueY','estX','estY'])
+        w.writerows(csv_rows)
+    print(f"{fn} saved ({frame} frames)")
+
+if __name__=="__main__":
+    for r in RESOLUTIONS:
+        for a in ALGORITHMS:
+            run_experiment(r,a)
